@@ -366,8 +366,113 @@ def phase_exit_review(dry_run: bool = False) -> int:
             "setup_reason": "short_premium_idx_vrp",
         })
         if dec.should_close and not dry_run:
-            _log(f"  → auto-close logic TBD (will wire once paper-trade validates)")
-            # TODO: build close orders via TigerBroker.submit_order
+            if _is_vidar_auto_close_active():
+                _close_vidar_position(b, pos, dec)
+            else:
+                _log(f"  → auto-close INACTIVE (VIDAR_AUTO_CLOSE / paper-mode gate); "
+                     f"would close {pos.underlying} {pos.expiry} ({dec.severity})")
+    return 0
+
+
+def _is_vidar_auto_close_active() -> bool:
+    """Whether phase_exit_review should auto-close VIDAR positions.
+
+    Rules:
+      1. If VIDAR_AUTO_CLOSE=0 explicitly -> OFF (kill switch)
+      2. If VIDAR_AUTO_CLOSE=1 explicitly -> ON (override)
+      3. Else: ON if account_type=paper, OFF if account_type=live
+    """
+    explicit = os.environ.get("VIDAR_AUTO_CLOSE", "").strip().lower()
+    if explicit in ("0", "false", "off", "no"):
+        return False
+    if explicit in ("1", "true", "on", "yes"):
+        return True
+    account_type = os.environ.get("TIGER_ACCOUNT_TYPE", "paper").lower()
+    return account_type == "paper"
+
+
+def _close_vidar_position(b, pos, dec) -> int:
+    """Close a VIDAR iron condor by submitting 4 single-leg close orders.
+
+    Close side reversal vs open:
+      - Short legs: BUY to close
+      - Long  legs: SELL to close
+    Limits: BUY uses mid x 1.02, SELL uses mid x 0.98 (1-tick edge).
+    Audit tag: stage=vidar_exit_auto_close, setup_reason=auto_close_exit_review.
+    """
+    _log(f"  -> AUTO-CLOSE VIDAR {pos.underlying} {pos.expiry} ({dec.severity}: {dec.reason})")
+    try:
+        from tigeropen.trade.domain.order import Order
+        from tigeropen.common.util.contract_utils import option_contract
+    except ImportError as exc:
+        _log(f"  ! tigeropen import failed: {exc}")
+        return 1
+
+    legs = [
+        ("short_call", pos.short_call_strike, "C", "BUY"),
+        ("long_call",  pos.long_call_strike,  "C", "SELL"),
+        ("short_put",  pos.short_put_strike,  "P", "BUY"),
+        ("long_put",   pos.long_put_strike,   "P", "SELL"),
+    ]
+
+    # Build OCC identifiers (SPY  YYMMDD{Right}{Strike*1000 padded 8)
+    try:
+        exp_dt = datetime.strptime(pos.expiry, "%Y-%m-%d").date()
+    except Exception as exc:
+        _log(f"  ! bad expiry {pos.expiry}: {exc}")
+        return 1
+    exp_str = exp_dt.strftime("%y%m%d")
+    sym_padded = pos.underlying.ljust(6)[:6]
+
+    submitted = 0
+    for leg_name, strike, right, side in legs:
+        strike_padded = f"{int(round(float(strike) * 1000)):08d}"
+        identifier = f"{sym_padded}{exp_str}{right}{strike_padded}"
+        # Get mid price from broker
+        try:
+            contract = option_contract(identifier)
+            quote = b._trade_client.get_quote(contract) if hasattr(b._trade_client, "get_quote") else None
+            mid = float(getattr(quote, "latest_price", 0) or 0) if quote else 0
+        except Exception:
+            mid = 0
+        if mid <= 0:
+            _log(f"  ! {leg_name} {identifier} no mid price, skipping")
+            continue
+        limit = round(mid * (1.02 if side == "BUY" else 0.98), 2)
+        try:
+            order = Order(
+                account=b.config.account_id,
+                contract=contract,
+                action=side,
+                order_type="LMT",
+                quantity=pos.quantity,
+                limit_price=limit,
+                time_in_force="GTC",
+            )
+            result = b._trade_client.place_order(order)
+            order_id = str(getattr(result, "order_id", "?"))
+            _log(f"    {side} {pos.quantity} {pos.underlying} {strike}{right} @ {limit} -> order_id={order_id}")
+            submitted += 1
+            _audit({
+                "stage": "vidar_exit_auto_close",
+                "underlying": pos.underlying,
+                "expiry": pos.expiry,
+                "leg": leg_name,
+                "strike": strike,
+                "right": right,
+                "quantity": pos.quantity,
+                "side": side,
+                "limit_price": limit,
+                "exit_reason": dec.severity,
+                "rationale": dec.reason,
+                "order_id": order_id,
+                "tag": "vidar.idx",
+                "scope": "vidar",
+                "setup_reason": "auto_close_exit_review",
+            })
+        except Exception as exc:
+            _log(f"  ! close order failed for {leg_name}: {exc}")
+    _log(f"  -> AUTO-CLOSE done: {submitted}/4 legs submitted")
     return 0
 
 
