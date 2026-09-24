@@ -186,11 +186,20 @@ def phase_open(dry_run: bool = False) -> int:
         return 0
 
     # Apply mid × 1.02 to all 4 legs (mirrors place_vertical.py safety)
+    # then round to the SPY options 0.05 tick grid (Tiger rejects with
+    # "tick size: 0.01" when a limit isn't on the grid; the message is
+    # misleading — the actual SPY tick is 0.05 for sub-$3 strikes).
+    # See references/tiger-occ-tick-grid-2026-09-24.md (forthcoming).
     legs = p["mids"]
-    short_put_limit = round(legs["short_put"] * 1.02, 2)
-    long_put_limit = round(legs["long_put"] * 1.02, 2)
-    short_call_limit = round(legs["short_call"] * 1.02, 2)
-    long_call_limit = round(legs["long_call"] * 1.02, 2)
+    _TICK = 0.05
+
+    def _round_tick(price: float, tick: float = _TICK) -> float:
+        return round(price / tick) * tick
+
+    short_put_limit = _round_tick(legs["short_put"] * 1.02)
+    long_put_limit = _round_tick(legs["long_put"] * 1.02)
+    short_call_limit = _round_tick(legs["short_call"] * 1.02)
+    long_call_limit = _round_tick(legs["long_call"] * 1.02)
 
     _log(
         f"  placing IC: SPY {p['expiry']} "
@@ -214,7 +223,7 @@ def phase_open(dry_run: bool = False) -> int:
             short_put_limit=short_put_limit,
             long_put_limit=long_put_limit,
         )
-        _log(f"  ✓ placed: order_id={getattr(result, 'order_id', '?')} status={getattr(result, 'status', '?')}")
+        _log(f"  ✓ placed: order_id={getattr(result, 'order_id', '?')} status={getattr(result, 'status', '?')} message={getattr(result, 'message', '?')[:200]!r}")
         _audit({
             "stage": "vidar_open",
             "underlying": "SPY",
