@@ -54,21 +54,42 @@ AUDIT_LOG = Path("/home/freya/RAGNAR/verticals_bot_audit.jsonl")
 MAX_VIDAR_ICS = int(os.environ.get("VIDAR_MAX_OPEN_ICS", "1"))
 
 
-def _count_vidar_open_ics(audit_log_path: Path = AUDIT_LOG) -> tuple[int, list[tuple]]:
-    """Count currently-open VIDAR iron condors via audit-log walk.
+def _count_vidar_open_ics(broker, audit_log_path: Path = AUDIT_LOG) -> tuple[int, list[tuple]]:
+    """Count actually-open VIDAR iron condors by cross-referencing audit
+    log with current broker positions.
 
-    Returns (count, [(sym, expiry, [4 strikes])...]). Each vidar_open
-    event with status=FILLED contributes 1 IC. Subtract close events of
-    any kind (vidar_close, broker_expired, stranded_leg_auto_close,
-    manual_close) for the same contract legs.
+    A vidar_open audit event counts as 'actually open' if at least one
+    of its 4 strikes has a current broker position. This:
+      - correctly ignores cron orders that were never filled (audit
+        status=PENDING is stale; cron doesn't poll fill status)
+      - correctly counts cron orders that DID fill but had some legs
+        closed (orphan leg still has exposure)
+      - correctly excludes ICs that were fully closed (no broker legs)
 
-    Pure audit-log walk — no broker calls. Robust to listener outages.
+    Returns (count, [(sym, expiry, [strikes])...]) for the active set.
+
+    The previous version counted vidar_open events alone, which over-
+    counted by including orders that the broker rejected/expired before
+    filling but were never re-marked in the audit log. Caught 2026-09-25.
     """
     from collections import defaultdict
 
-    # leg_key → net open count (vidar_open increments, close events decrement)
+    # 1. Get the set of (sym, expiry, strike) tuples that have current
+    #    broker positions in OPT.
+    broker_legs: set[tuple] = set()
+    positions = broker._trade_client.get_positions(sec_type="OPT") or []
+    for pos in positions:
+        c = pos.contract
+        if not c:
+            continue
+        sym = getattr(c, "symbol", "")
+        expiry = getattr(c, "expiry", "")
+        strike = float(getattr(c, "strike", 0) or 0)
+        broker_legs.add((sym, expiry, strike))
+
+    # 2. Walk audit log for vidar_open events with non-REJECTED status.
     leg_counts: dict[tuple, int] = defaultdict(int)
-    ics: list[dict] = []  # [{expiry, strikes: [...]}]
+    ics: list[dict] = []
 
     if not audit_log_path.exists():
         return 0, []
@@ -87,19 +108,13 @@ def _count_vidar_open_ics(audit_log_path: Path = AUDIT_LOG) -> tuple[int, list[t
             sym = ev.get("underlying", "")
             expiry = ev.get("expiry", "")
 
-            # vidar_open events: count as opens unless status=REJECTED.
-            # PENDING means the broker accepted the order but the audit
-            # log doesn't update when it later FILLS (cron doesn't poll).
-            # Treat PENDING as potentially-open — conservative.
             if stage == "vidar_open" and status != "OrderStatus.REJECTED":
-                # ICs store 4 strikes in custom fields (not the top-level strike).
                 strikes = [
                     ev.get("short_put_strike"),
                     ev.get("short_call_strike"),
                     ev.get("long_put_strike"),
                     ev.get("long_call_strike"),
                 ]
-                # Track as an IC if all 4 strikes present
                 if all(s for s in strikes):
                     ics.append({"sym": sym, "expiry": expiry, "strikes": strikes})
                     for s in strikes:
@@ -108,25 +123,23 @@ def _count_vidar_open_ics(audit_log_path: Path = AUDIT_LOG) -> tuple[int, list[t
                         )
             elif stage in ("vidar_close", "broker_expired",
                           "stranded_leg_auto_close", "manual_close"):
-                # Subtract a VIDAR-owned close. vidar_close/broker_expired
-                # only carry one strike per event.
                 close_strike = ev.get("strike", 0)
                 if close_strike:
                     leg_counts[(sym, expiry, close_strike)] = (
                         leg_counts.get((sym, expiry, close_strike), 0) - 1
                     )
 
-    # Net active ICs: those with at least one leg still positive.
-    # We use `any` (not `all`) so an IC with an orphan leg (3 of 4
-    # closed) still counts as 1 — the orphan is a real exposure that
-    # must not be double-stacked. Once all 4 legs close, the IC drops.
+    # 3. An IC is "actually open" if ANY of its strikes has BOTH:
+    #    - positive audit count (not fully closed in audit)
+    #    - a current broker position (still held at the broker)
     active_ics = []
     for ic in ics:
-        any_legs_open = any(
+        any_open = any(
             leg_counts.get((ic["sym"], ic["expiry"], s), 0) > 0
+            and (ic["sym"], ic["expiry"], s) in broker_legs
             for s in ic["strikes"]
         )
-        if any_legs_open:
+        if any_open:
             active_ics.append((ic["sym"], ic["expiry"], ic["strikes"]))
 
     return len(active_ics), active_ics
@@ -258,12 +271,13 @@ def phase_open(dry_run: bool = False) -> int:
     ))
 
     # 2026-09-25: VIDAR-scoped cap. Count only VIDAR-owned ICs (via
-    # audit-log walk). Previously this counted ALL SPY positions, which
-    # meant other strategies' positions or manual test probes would block
-    # VIDAR from opening — exactly the kind of cross-strategy interference
-    # the operator wants to prevent. Now `MAX_VIDAR_ICS` is checked against
-    # VIDAR-owned positions only.
-    vidar_open_count, _active_ics = _count_vidar_open_ics(AUDIT_LOG)
+    # audit-log walk cross-referenced with broker positions). Previously
+    # this counted ALL SPY positions, which meant other strategies'
+    # positions or manual test probes would block VIDAR from opening —
+    # exactly the kind of cross-strategy interference the operator wants
+    # to prevent. Now `MAX_VIDAR_ICS` is checked against VIDAR-owned
+    # positions only.
+    vidar_open_count, _active_ics = _count_vidar_open_ics(b, AUDIT_LOG)
     if vidar_open_count >= MAX_VIDAR_ICS:
         _log(f"  ! VIDAR cap reached ({vidar_open_count} VIDAR-owned IC(s), "
              f"cap={MAX_VIDAR_ICS}). Skipping open.")
