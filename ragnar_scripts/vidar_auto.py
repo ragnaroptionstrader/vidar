@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone, date
 from pathlib import Path
 
@@ -88,8 +89,12 @@ def _count_vidar_open_ics(broker, audit_log_path: Path = AUDIT_LOG) -> tuple[int
         broker_legs.add((sym, expiry, strike))
 
     # 2. Walk audit log for vidar_open events with non-REJECTED status.
+    #    Also collect vidar_open_update events that override the status
+    #    with the actual broker-side result (cron polls after placement,
+    #    so a PENDING vidar_open can later become FILLED/REJECTED).
     leg_counts: dict[tuple, int] = defaultdict(int)
     ics: list[dict] = []
+    updates: dict[str, str] = {}  # order_id → actual status from poll
 
     if not audit_log_path.exists():
         return 0, []
@@ -107,20 +112,32 @@ def _count_vidar_open_ics(broker, audit_log_path: Path = AUDIT_LOG) -> tuple[int
             status = ev.get("status", "")
             sym = ev.get("underlying", "")
             expiry = ev.get("expiry", "")
+            order_id = ev.get("order_id", "")
 
-            if stage == "vidar_open" and status != "OrderStatus.REJECTED":
-                strikes = [
-                    ev.get("short_put_strike"),
-                    ev.get("short_call_strike"),
-                    ev.get("long_put_strike"),
-                    ev.get("long_call_strike"),
-                ]
-                if all(s for s in strikes):
-                    ics.append({"sym": sym, "expiry": expiry, "strikes": strikes})
-                    for s in strikes:
-                        leg_counts[(sym, expiry, s)] = (
-                            leg_counts.get((sym, expiry, s), 0) + 1
-                        )
+            if stage == "vidar_open":
+                # If there's a corresponding vidar_open_update, use
+                # that status instead. The poll catches cases where
+                # the broker rejected or expired the order after the
+                # initial PENDING was logged.
+                effective_status = updates.get(order_id, status)
+                if effective_status != "OrderStatus.REJECTED":
+                    strikes = [
+                        ev.get("short_put_strike"),
+                        ev.get("short_call_strike"),
+                        ev.get("long_put_strike"),
+                        ev.get("long_call_strike"),
+                    ]
+                    if all(s for s in strikes):
+                        ics.append({"sym": sym, "expiry": expiry, "strikes": strikes})
+                        for s in strikes:
+                            leg_counts[(sym, expiry, s)] = (
+                                leg_counts.get((sym, expiry, s), 0) + 1
+                            )
+            elif stage == "vidar_open_update":
+                # Capture the polled status keyed by order_id so the
+                # vidar_open above can adopt it.
+                if order_id:
+                    updates[order_id] = status
             elif stage in ("vidar_close", "broker_expired",
                           "stranded_leg_auto_close", "manual_close"):
                 close_strike = ev.get("strike", 0)
@@ -209,6 +226,65 @@ def phase_pre_build(dry_run: bool = False) -> int:
             "setup_reason": "short_premium_idx_vrp",
         })
     return 0
+
+
+_POLL_FILLED_TIMEOUT_SEC = int(os.environ.get("VIDAR_OPEN_POLL_SEC", "30"))
+_POLL_FILLED_INTERVAL_SEC = 5
+
+
+def _poll_vidar_order_status(
+    broker, order_id: str, max_wait_sec: int = _POLL_FILLED_TIMEOUT_SEC
+):
+    """Poll the broker for the actual fill status of an order.
+
+    Tiger's `place_combo_iron_condor` returns synchronously with status
+    PENDING — Tiger accepts the order immediately, but the actual fill
+    (or rejection/expiry) happens asynchronously. Without polling, the
+    audit log forever says PENDING even if the broker rejected the
+    order before filling. Caught 2026-09-25: 3 such stale PENDING
+    events would have over-counted the cap.
+
+    Args:
+        broker: TigerBroker instance.
+        order_id: order_id returned from place_combo_iron_condor.
+        max_wait_sec: total time to wait before giving up. Default 30s.
+            Cron jobs have a 120s timeout, so 30s leaves headroom.
+
+    Returns:
+        OrderResult from get_order() (latest broker-side status) or
+        None if get_order returned None throughout.
+    """
+    if not order_id:
+        return None
+
+    elapsed = 0
+    while elapsed < max_wait_sec:
+        try:
+            r = broker.get_order(str(order_id))
+        except Exception as e:
+            _log(f"  poll: get_order failed ({e!r}); sleeping {_POLL_FILLED_INTERVAL_SEC}s")
+            time.sleep(_POLL_FILLED_INTERVAL_SEC)
+            elapsed += _POLL_FILLED_INTERVAL_SEC
+            continue
+
+        if r is None:
+            time.sleep(_POLL_FILLED_INTERVAL_SEC)
+            elapsed += _POLL_FILLED_INTERVAL_SEC
+            continue
+
+        # Stop polling if terminal status reached
+        if str(r.status) in (
+            "OrderStatus.FILLED",
+            "OrderStatus.REJECTED",
+            "OrderStatus.EXPIRED",
+            "OrderStatus.CANCELLED",
+            "OrderStatus.PARTIAL_FILLED",
+        ):
+            return r
+        time.sleep(_POLL_FILLED_INTERVAL_SEC)
+        elapsed += _POLL_FILLED_INTERVAL_SEC
+
+    return None
 
 
 def phase_open(dry_run: bool = False) -> int:
@@ -329,6 +405,8 @@ def phase_open(dry_run: bool = False) -> int:
             long_put_limit=long_put_limit,
         )
         _log(f"  ✓ placed: order_id={getattr(result, 'order_id', '?')} status={getattr(result, 'status', '?')} message={getattr(result, 'message', '?')[:200]!r}")
+        order_id = str(getattr(result, 'order_id', '') or '')
+        initial_status = str(getattr(result, 'status', None))
         _audit({
             "stage": "vidar_open",
             "underlying": "SPY",
@@ -340,12 +418,50 @@ def phase_open(dry_run: bool = False) -> int:
             "long_call_strike": p["long_call_strike"],
             "net_credit": p["net_credit_total"],
             "max_loss": p["max_loss_total"],
-            "order_id": getattr(result, 'order_id', None),
-            "status": str(getattr(result, 'status', None)),
+            "order_id": order_id,
+            "status": initial_status,
             "setup_reason": "short_premium_idx_vrp",
             "tag": "vidar.idx",
             "scope": "vidar",
         })
+
+        # 2026-09-25: Post-placement poll for actual fill status. The
+        # broker returned PENDING synchronously, but the audit log
+        # shouldn't keep PENDING if the broker later FILLED or REJECTED.
+        # Without this, _count_vidar_open_ics over-counts stale
+        # PENDING events (cron never knows they didn't fill).
+        polled = _poll_vidar_order_status(b, order_id)
+        if polled is None:
+            _log("  ! poll timeout — order may still be PENDING at broker")
+            _audit({
+                "stage": "vidar_open_poll_timeout",
+                "underlying": "SPY",
+                "expiry": p["expiry"],
+                "order_id": order_id,
+                "initial_status": initial_status,
+                "tag": "vidar.idx",
+                "scope": "vidar",
+            })
+        else:
+            polled_status = str(getattr(polled, 'status', None))
+            if polled_status != initial_status:
+                _log(f"  ✓ poll: order_id={order_id} {initial_status} → {polled_status} "
+                     f"(filled_qty={getattr(polled, 'filled_quantity', 0)} "
+                     f"avg_fill={getattr(polled, 'filled_price', 0)})")
+                _audit({
+                    "stage": "vidar_open_update",
+                    "underlying": "SPY",
+                    "expiry": p["expiry"],
+                    "order_id": order_id,
+                    "initial_status": initial_status,
+                    "status": polled_status,
+                    "filled_quantity": getattr(polled, 'filled_quantity', 0),
+                    "filled_price": getattr(polled, 'filled_price', 0.0),
+                    "tag": "vidar.idx",
+                    "scope": "vidar",
+                })
+            else:
+                _log(f"  poll: status unchanged ({polled_status})")
     except Exception as exc:
         _log(f"  ! place_combo_iron_condor failed: {exc}")
         _audit({

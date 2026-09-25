@@ -323,3 +323,133 @@ def test_cron_audit_pending_no_broker_position_is_zero():
         "This is the exact bug from 2026-09-25 — cron submitted 3 ICs, "
         "none filled, but my code counted all 3 as 'open'."
     )
+
+
+def test_vidar_open_update_rejected_overrides_pending():
+    """A vidar_open with status=PENDING followed by a vidar_open_update
+    with status=REJECTED for the same order_id should NOT count as open.
+    The post-placement poll (added 2026-09-25) catches cases where the
+    broker rejected/expired the order after the initial PENDING log."""
+    from ragnar_scripts.vidar_auto import _count_vidar_open_ics
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+        f.write("")
+        audit_path = Path(f.name)
+    order_id = "44746684098430976"
+    events = [
+        {**_vidar_open(sc=798, lc=803, sp=730, lp=725, status="OrderStatus.PENDING"),
+         "order_id": order_id},
+        {"stage": "vidar_open_update", "strategy": "vidar",
+         "underlying": "SPY", "expiry": "2026-10-30",
+         "order_id": order_id,
+         "initial_status": "OrderStatus.PENDING",
+         "status": "OrderStatus.REJECTED"},
+    ]
+    _make_audit(audit_path, events)
+    # No broker positions — the order was rejected
+    broker = _make_fake_broker([])
+    count, _ = _count_vidar_open_ics(broker, audit_path)
+    assert count == 0
+
+
+def test_vidar_open_update_filled_keeps_count():
+    """A vidar_open with status=PENDING followed by a vidar_open_update
+    with status=FILLED for the same order_id should still count as open
+    if broker has matching positions."""
+    from ragnar_scripts.vidar_auto import _count_vidar_open_ics
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+        f.write("")
+        audit_path = Path(f.name)
+    order_id = "44747387577583616"
+    events = [
+        {**_vidar_open(sc=798, lc=803, sp=730, lp=725, status="OrderStatus.PENDING"),
+         "order_id": order_id},
+        {"stage": "vidar_open_update", "strategy": "vidar",
+         "underlying": "SPY", "expiry": "2026-10-30",
+         "order_id": order_id,
+         "initial_status": "OrderStatus.PENDING",
+         "status": "OrderStatus.FILLED",
+         "filled_quantity": 1, "filled_price": 1.06},
+    ]
+    _make_audit(audit_path, events)
+    # Broker has the matching positions
+    broker = _make_fake_broker([
+        ("SPY", "2026-10-30", 798),
+        ("SPY", "2026-10-30", 803),
+        ("SPY", "2026-10-30", 730),
+        ("SPY", "2026-10-30", 725),
+    ])
+    count, _ = _count_vidar_open_ics(broker, audit_path)
+    assert count == 1
+
+
+def test_poll_vidar_order_status_returns_filled():
+    """Smoke test the poll helper — it should return an OrderResult
+    when get_order returns FILLED on first try."""
+    from ragnar_scripts.vidar_auto import _poll_vidar_order_status
+
+    class FakeResult:
+        def __init__(self, status):
+            self.status = status
+            self.filled_quantity = 1
+            self.filled_price = 1.0
+
+    class FakeBroker:
+        def __init__(self):
+            self.calls = 0
+        def get_order(self, order_id):
+            self.calls += 1
+            return FakeResult("OrderStatus.FILLED")
+
+    b = FakeBroker()
+    r = _poll_vidar_order_status(b, "12345", max_wait_sec=10)
+    assert r is not None
+    assert str(r.status) == "OrderStatus.FILLED"
+    assert b.calls == 1
+
+
+def test_poll_vidar_order_status_returns_none_on_timeout():
+    """Poll helper returns None if get_order keeps returning PENDING
+    past the timeout."""
+    from ragnar_scripts.vidar_auto import _poll_vidar_order_status
+
+    class FakeResult:
+        def __init__(self, status):
+            self.status = status
+            self.filled_quantity = 0
+            self.filled_price = 0.0
+
+    class FakeBroker:
+        def get_order(self, order_id):
+            return FakeResult("OrderStatus.PENDING")
+
+    b = FakeBroker()
+    r = _poll_vidar_order_status(b, "12345", max_wait_sec=1)
+    assert r is None  # timed out without terminal status
+
+
+def test_poll_vidar_order_status_handles_exception():
+    """Poll helper retries on exception (e.g. broker network blip)."""
+    from ragnar_scripts.vidar_auto import _poll_vidar_order_status
+
+    class FakeResult:
+        def __init__(self, status):
+            self.status = status
+            self.filled_quantity = 0
+            self.filled_price = 0.0
+
+    class FakeBroker:
+        def __init__(self):
+            self.calls = 0
+        def get_order(self, order_id):
+            self.calls += 1
+            if self.calls == 1:
+                raise ConnectionError("transient")
+            return FakeResult("OrderStatus.FILLED")
+
+    b = FakeBroker()
+    r = _poll_vidar_order_status(b, "12345", max_wait_sec=30)
+    assert r is not None
+    assert str(r.status) == "OrderStatus.FILLED"
+    assert b.calls == 2
